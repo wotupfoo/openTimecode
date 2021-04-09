@@ -35,3 +35,6 @@
 .pio/*
 .vscode/*
 *.code-workspace
+
+# dead code
+oldcode.c
