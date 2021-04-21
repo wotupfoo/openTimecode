@@ -4,7 +4,7 @@
 #define _DEBUG_SCOPE_H_
 
 #define BUFF_DEBUG_SIZE 4096
-static char buff_debug[BUFF_DEBUG_SIZE];
+//static char buff_debug[BUFF_DEBUG_SIZE];
 
 void inline SCOPESET(uint8_t x) {
 #ifdef DEBUG
