@@ -11,8 +11,9 @@
 // ESP32 HARDWARE PIN ASSIGNMENTS
 #include "esp32_pins.h"
 
-// ESP32 Watchdog
+// ESP32 headers
 #include <esp_task_wdt.h>
+#include <esp_sleep.h>
 
 // !!!!!!! THIS IS NOT MULTI-THREADED !!!!!!!!!
 // !!!!!!! YOU CAN'T USE IT ON CORE 1 !!!!!!!!!
@@ -73,16 +74,25 @@
 #define TIMECODE_Y 16		// last line 56 // last-1 line 48 = (SML_FONT_Y*TIMECODE_LINE)
 
 // RTC CLOCK
-#define TICK_8KHZ 8192
+#define TICK_32KHZ 8192
+#define D_TICK_32KHZ 8192.0
+#define TICK_16KHZ 16384
+#define D_TICK_16KHZ 16384.0
+#define TICK_8KHZ 32768
+#define D_TICK_8KHZ 32768.0
+#define RTC_TICK_RATE TICK_16KHZ
+#define D_RTC_TICK_RATE D_TICK_16KHZ
 
 // Linear Time Code
 #define LTC_PACKET_BITS 80
+#define D_LTC_PACKET_BITS 80.0
 #define LTC_PACKET_BYTES 10
+#define D_LTC_PACKET_BYTES 10.0
 #define LTC_FPS_F_MAX 30.0
 #define LTC_FPS_MAX 30
 #define LTC_FPS_F_MIN 24.0
 #define LTC_FPS_MIN 24
-#define LTC_AUDIO_RATE TICK_8KHZ
+#define LTC_AUDIO_RATE RTC_TICK_RATE
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -113,11 +123,11 @@ SemaphoreHandle_t semOLED = NULL;
 SemaphoreHandle_t xRTC = NULL;
 
 // Interrupts
-static volatile bool rtc_tick_1Hz;					// 1Hz Interrupt pin value;
-static volatile uint16_t rtc_tick_count;			// 8kHz RTC Interrupt counter
-static volatile uint16_t ltc_frame_tick_count;		// rtc_tick_count reset per frame
-static volatile uint16_t ltc_frame_tick_count_prev; // the number of ticks in the prior frame
-
+static volatile bool rtc_tick_1Hz;						// 1Hz Interrupt pin value;
+static volatile uint16_t rtc_tick_count;				// 8kHz RTC Interrupt counter
+static volatile uint16_t rtc_tick_count_per_frame;		// rtc_tick_count reset per frame
+static volatile uint16_t rtc_tick_count_per_frame_prev; // the number of ticks in the prior frame
+static long int ltc_decode_frame_total;
 // --------------------------------------------
 // RTC
 // --------------------------------------------
@@ -133,16 +143,20 @@ float RTCtemperature;
 static LTCEncoder *LTCencoder;
 static enum LTC_TV_STANDARD tv;
 static int LTCencoder_flags = 0;
-static ltcsnd_sample_t LTCaudio_out[(LTC_AUDIO_RATE / LTC_FPS_MIN) + 1];
+// There are two output buffers that are alternated - one being created, one being transmitted.
+static ltcsnd_sample_t LTCaudio_out[2][(LTC_AUDIO_RATE / LTC_FPS_MIN) + 1];
+static bool LTCaudio_out_index = 0; // Index used to toggle the buffer used
 
 static volatile uint16_t LTCfps = LTC_FPS_MAX;	// Timecode (24,30,60) default to 30fps tick
 static volatile double dLTCfps = LTC_FPS_F_MAX; // Timecode (24,30,60) default to 30fps tick
 static volatile uint8_t LTCframe = 0;			// Current frame (0..fps-1) from input
 static volatile uint8_t LTCbyte = 0;			// Current LTC bit from input
 static volatile uint8_t LTCbit = 0;				// Current LTC bit from input
-static uint16_t constLTCbit_8kHzTicks;			// #ticks for one LTC bit
-static uint16_t constLTCbyte_8kHzTicks;			// #ticks for one LTC byte
-static uint16_t constLTCframe_8kHzTicks;		// #ticks for one LTC frame
+
+// NOTE - Do not use uint16_t. It has a LOT of rounding error
+static double d_constLTCframe_8kHzTicks; // #ticks for one LTC frame (floating point)
+static double d_constLTCbyte_8kHzTicks;	 // #ticks for one LTC byte (floating point)
+static double d_constLTCbit_8kHzTicks;	 // #ticks for one LTC bit (floating point)
 
 // Timecode IN
 static LTCDecoder *LTCdecoder;
@@ -234,7 +248,6 @@ void setup()
 		// INPUTS
 		pinMode(LTC_INPUT_PIN, INPUT); // Audio/LTC ADC Input
 		pinMode(INT_8KHZ_PIN, INPUT);  // 8kHz interrupt input
-									   //pinMode(INT_1HZ_PIN, INPUT);   // 1Hz interrupt input
 	}
 
 #if 0
@@ -279,7 +292,7 @@ void setup()
 		Serial.println("Starting LTC Encoder");
 
 		// Audio sample/generated rate
-		LTCaudiorate = TICK_8KHZ;
+		LTCaudiorate = RTC_TICK_RATE;
 		LTCfps = 30;
 		dLTCfps = 30.0;
 
@@ -307,7 +320,7 @@ void setup()
 	{
 		Serial.println("Starting LTC Decoder");
 		LTCdecoder = ltc_decoder_create(LTCaudiorate / LTCfps, // Sound buffer size (1 Frame @ 8.192kHz)
-										1);					   // #Queues
+										32);				   // #Queues
 		memset(LTCaudio_in, 0, sizeof(LTCaudio_in));
 		memset(LTCaudio_in_copy, 0, sizeof(LTCaudio_in_copy));
 	} // LTC DECODER
@@ -432,90 +445,87 @@ void setup()
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 
-volatile uint32_t debug_trap = 0;
 volatile bool interrupt_rtc_clock_active = false;
 // 32kHz tick coming from RTC
 void IRAM_ATTR interrupt_rtc_clock(void)
 {
+	SCOPEOFF(LED_BUILTIN); // Set in loop() to show idle. Cleared here.
 	SCOPEON(SCOPE_INT_8KHZ);
+	// Detect if an interrupt was triggered before this interrupt was serviced
 	if (interrupt_rtc_clock_active)
 	{
 		Serial.println("interrupt_rtc_clock - TRAP - interrupt re-entrance");
-		SCOPEON(LED_BUILTIN);
+		//SCOPEON(LED_BUILTIN);
 	}
 	interrupt_rtc_clock_active = true;
 
 	BaseType_t taskYieldRequired = false;
-	static uint16_t debug_rtc_tick_prev = 0;
-	bool isTickOverflow = (rtc_tick_count > TICK_8KHZ);
 
-	// THIS IS THE MASTER CLOCK 0..TICK_8KHZ-1
-	rtc_tick_count++;
-	ltc_frame_tick_count++;
+	// LTCdecode audio (the buffer to decode)
+	// In this case it's digital on/off input until there is a SPI audio chip
+	bool value = digitalRead(LTC_INPUT_PIN);
+	LTCaudio_in[rtc_tick_count_per_frame] = value ? 218 : 38;
+	digitalWrite(LTC_INPUT_DECODE, value);
 
-#if 0
-	// bug searching...
-	// Did the tick somehow get more than 1 vs the previous?
-	if (rtc_tick_count % TICK_8KHZ != (debug_rtc_tick_prev + 1) % TICK_8KHZ)
-	{
-		// Force a location for an software interrupt
-		// with a volatile variable access
-		debug_trap++;
-		Serial.println("interrupt_rtc_clock - TRAP - unserviced interrupt");
-		SCOPEON(LED_BUILTIN);
-	}
-	debug_rtc_tick_prev = rtc_tick_count;
-#endif
-
-	//  Compare to the tick number for a given frame (0..29) at a given fps (24,25,30)
-	uint8_t trig_index = fps_to_trigger_ticks(dLTCfps);
-	uint16_t tick_current_frame = trigger_ticks_8kHz[trig_index][LTCframe];
-
-	if (isTickOverflow)
-	{
-		//SCOPEON(LED_BUILTIN);
-	}
-	else
-	{
-		// LTCdecode audio (the buffer to decode)
-		//uint16_t audio_offset = rtc_tick_count % constLTCframe_8kHzTicks;
-		bool value = digitalRead(LTC_INPUT_PIN);
-		LTCaudio_in[ltc_frame_tick_count] = value ? 218 : 38;
-		digitalWrite(LTC_INPUT_DECODE, value);
-
-		// LTCencode
-		uint8_t audio = LTCaudio_out[ltc_frame_tick_count];
-		//Serial.println(audio);
-		// LTCencode audio (already created)
-		// NOTE: The audio out buffer holds a single frame
-		// Send next LTC frame DIGITAL audio value (unsigned char)
-		/* 	-3.0 dBFS default
+	// LTCencode
+	uint8_t audio = LTCaudio_out[LTCaudio_out_index][rtc_tick_count_per_frame];
+	//Serial.println(audio);
+	// LTCencode audio (already created)
+	// NOTE: The audio out buffer holds a single frame
+	//       The audio values are a square wave unless the low pass filter is enabled
+	//       in which case the samples will be analog changing values.
+	// Send next LTC frame DIGITAL audio value (unsigned char)
+	/* 	-3.0 dBFS default
 				e->enc_lo = 38;
 				e->enc_hi = 218;
 		*/
-		if (audio > 128)
-		{
-			digitalWrite(LTC_OUTPUT_PIN, HIGH);
-		}
-		else
-		{
-			digitalWrite(LTC_OUTPUT_PIN, LOW);
-		}
+	if (audio > 128)
+	{
+		digitalWrite(LTC_OUTPUT_PIN, HIGH);
+	}
+	else
+	{
+		digitalWrite(LTC_OUTPUT_PIN, LOW);
 	}
 
-	// Even with aggregated summing/multiplication errors doing #bytes * constLTCbyte_8kHzTicks
-	// vs the actual tick it's supposed to be if you did the calc in floating point, it's close enough
-	// and it saves having floating point math or a huge table
-	// NOTE - If I see too much jitter on the LTC output I'll have to change this to floating point calcs.
-	bool isNewLTCbyte = (rtc_tick_count > tick_current_frame + ((LTCbyte + 1) * constLTCbyte_8kHzTicks));
+	bool isNewLTCbyte;
+	// On the last byte of the last frame of the second instead of waiting for
+	// the calculated end of frame & byte, instead look for the elapsing of a
+	// second to keep in sync and remove any cumulative rounding errors in the calculations
+	if ((LTCframe + 1 == LTCfps) && (LTCbyte + 1 == LTCbyte))
+	{
+		isNewLTCbyte = (rtc_tick_count >= RTC_TICK_RATE);
+	}
+	else
+	{
+		double next_byte = (double)((LTCframe * LTC_PACKET_BYTES) + (LTCbyte + 1));
+		uint16_t tick_next_byte = (uint16_t)ceil(next_byte * d_constLTCbyte_8kHzTicks);
+		isNewLTCbyte = (rtc_tick_count > tick_next_byte);
+	}
 	if (isNewLTCbyte)
 	{
 		SCOPEON(SCOPE_TIMECODE_BYTE);
-		++LTCbyte %= LTC_PACKET_BYTES;
+		/* This ltc_encoder_encode_byte() is very slow.
+		   It makes the total length of the interrupt longer than the interrupt period (~61uS 16kHz):
+		   ~74uSec when isNewFrame
+		   ~56uS when !isNewFrame
+		   Interrupt servicing is queued (vs missed or re-enterant) so the next interrupt
+		   (!isNewByte) is back-to-back with this call and is very short at ~2uS so it can 
+		   catch up from being behind so that the 3rd interrupt (another !isNewByte ~2uS) is 
+		   back to no delay. */
 		ltc_encoder_encode_byte(LTCencoder, LTCbyte, 1.0);
 
-		uint16_t tick_next_frame = trigger_ticks_8kHz[trig_index][LTCframe + 1];
-		bool isNewLTCframe = (rtc_tick_count > tick_next_frame);
+		bool isNewLTCframe;
+		if (LTCframe + 1 == LTCfps)
+		{
+			isNewLTCframe = (rtc_tick_count >= RTC_TICK_RATE);
+		}
+		else
+		{
+			double next_frame = (double)(LTCframe + 1);
+			uint16_t tick_next_frame = (uint16_t)ceil(next_frame * d_constLTCframe_8kHzTicks);
+			isNewLTCframe = (rtc_tick_count > tick_next_frame);
+		}
 		if (isNewLTCframe)
 		{
 			SCOPEON(SCOPE_TIMECODE_FRAME);
@@ -530,34 +540,37 @@ void IRAM_ATTR interrupt_rtc_clock(void)
 						isNewLTCframe ? '1':'0');
 			Serial.print(buff_debug);
 		*/
-			++LTCframe %= LTCfps;
-			// Wrap to 0 when it is 8192 on the last frame of the second
-			// Thus the 0'th tick is actually processed here at 8192
-			// Do it in here because it only needs to be done when it's the last frame
-			// Thus saving unnecessary processing in NewByte or NewSample
-			rtc_tick_count %= TICK_8KHZ;
-			ltc_frame_tick_count_prev = ltc_frame_tick_count;
-			ltc_frame_tick_count = 0xFFFF;
+			// Store the number of samples for this frame to use in the LTC decoder
+			rtc_tick_count_per_frame_prev = rtc_tick_count_per_frame;
+			// Restart the frame tick
+			rtc_tick_count_per_frame = 0;
+
+			// Select the other LTC audio output buffer
+			LTCaudio_out_index = !(LTCaudio_out_index);
+			// Copy the encoding of the next frame to the audio output buffer
+			// The frame encoding has been done on a byte by byte basis to keep the
+			// interrupt execution time and jitter to a minimum. More determanistic too.
+			ltc_encoder_copy_buffer(LTCencoder, LTCaudio_out[LTCaudio_out_index]);
 
 			// Update LTC OUT clock
 			ltc_encoder_inc_timecode(LTCencoder);
-			// Get updated audio out buffer data
-			ltc_encoder_copy_buffer(LTCencoder, LTCaudio_out);
 
 			// Wake up Timecode_task on each new frame
 			taskYieldRequired = xTaskResumeFromISR(hLTCtimecode_task);
+
+			++LTCframe %= LTCfps;
+			rtc_tick_count %= RTC_TICK_RATE;
 			SCOPEOFF(SCOPE_TIMECODE_FRAME);
 		} // if isNewLTCframe
+		++LTCbyte %= LTC_PACKET_BYTES;
 		SCOPEOFF(SCOPE_TIMECODE_BYTE);
 	} //if isNewLTCbyte
 
-	if (isTickOverflow)
-	{
-		//SCOPEOFF(LED_BUILTIN);
-	}
-
 	SCOPEOFF(SCOPE_INT_8KHZ);
 	interrupt_rtc_clock_active = false;
+
+	rtc_tick_count++;
+	rtc_tick_count_per_frame++;
 
 	if (taskYieldRequired == true)
 	{
@@ -598,9 +611,9 @@ void LTCtimecode_task(__unused void *pvParams)
 	// Initialize frame tick variables
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 	{
-		constLTCframe_8kHzTicks = TICK_8KHZ / LTCfps;
-		constLTCbyte_8kHzTicks = TICK_8KHZ / (LTCfps * LTC_PACKET_BYTES);
-		constLTCbit_8kHzTicks = TICK_8KHZ / (LTCfps * LTC_PACKET_BITS);
+		d_constLTCframe_8kHzTicks = D_RTC_TICK_RATE / dLTCfps;
+		d_constLTCbyte_8kHzTicks = d_constLTCframe_8kHzTicks / D_LTC_PACKET_BYTES;
+		d_constLTCbit_8kHzTicks = d_constLTCframe_8kHzTicks / D_LTC_PACKET_BITS;
 	}
 
 	xSemaphoreTake(xRTC, portMAX_DELAY);
@@ -616,10 +629,10 @@ void LTCtimecode_task(__unused void *pvParams)
 		// Turn on the internal oscillator & 8.192kHz Square Wave but not when on Vbat
 		RTCchip.enableOscillator(true, false, 3);
 		// Turn on the 32kHz output (this is divided using flip-flops to 8kHz)
-		RTCchip.enable32kHz(false);
+		RTCchip.enable32kHz(true);
 
-		rtc_tick_count = (uint16_t)0xFFFF; // This will trigger a new start in the interrupt
-		ltc_frame_tick_count = (uint16_t)0xFFFF;
+		rtc_tick_count = 0;
+		rtc_tick_count_per_frame = 0;
 
 		RTCtemperature = RTCchip.getTemperature();
 
@@ -652,6 +665,7 @@ void LTCtimecode_task(__unused void *pvParams)
 	LTCframe = 0;
 	LTCbyte = 0;
 	LTCbit = 0;
+	LTCaudio_out_index = 0;
 	// Initialize the LTC Encoder time from the RTC
 	snprintf(SMPTEtime.timezone, 6, "+0000");
 	SMPTEtime.years = RTCtime.year();
@@ -662,11 +676,17 @@ void LTCtimecode_task(__unused void *pvParams)
 	SMPTEtime.secs = RTCtime.second();
 	SMPTEtime.frame = LTCframe;
 	ltc_encoder_set_timecode(LTCencoder, &SMPTEtime);
-	ltc_encoder_encode_byte(LTCencoder, LTCbyte, 1.0);
-	ltc_encoder_copy_buffer(LTCencoder, LTCaudio_out);
+	ltc_encoder_encode_frame(LTCencoder);
+	ltc_encoder_copy_buffer(LTCencoder, LTCaudio_out[LTCaudio_out_index]);
 
-	//attachInterrupt(INT_1HZ_PIN, interrupt_1Hz, RISING);      // Make this BEFORE 32kHz
-	attachInterrupt(INT_8KHZ_PIN, interrupt_rtc_clock, FALLING); // Make this interrupt last
+	// LTC Decoder
+	ltc_decode_frame_total = 0;
+
+	// GPIO Input level to wake from light-sleep
+	gpio_wakeup_enable((gpio_num_t)INT_8KHZ_PIN, GPIO_INTR_LOW_LEVEL);
+	esp_sleep_enable_gpio_wakeup();
+
+	attachInterrupt(INT_8KHZ_PIN, interrupt_rtc_clock, FALLING); // Make this interrupt last as it triggers everything
 
 	for (;;)
 	{
@@ -684,28 +704,35 @@ void LTCtimecode_task(__unused void *pvParams)
 			uint16_t tick_prev_frame = trigger_ticks_8kHz[trig_index][LTCframe_prev];
 			size_t framesize = tick_current_frame - tick_prev_frame;
 */
-			memcpy(LTCaudio_in_copy, LTCaudio_in, ltc_frame_tick_count_prev);
+			memcpy(LTCaudio_in_copy, LTCaudio_in, rtc_tick_count_per_frame_prev);
+			/* for(int i=0;i< ltc_frame_tick_count_prev; i++)
+			{
+				Serial.println(LTCaudio_in_copy[i]);
+			} */
+
 			// Decode the LTC input
 			ltc_decoder_write(LTCdecoder,
 							  LTCaudio_in_copy,
-							  ltc_frame_tick_count_prev,
-							  0);
-			if (ltc_decoder_queue_length(LTCdecoder))
+							  rtc_tick_count_per_frame_prev,
+							  ltc_decode_frame_total++);
+			//if (ltc_decoder_queue_length(LTCdecoder))
 			{
 				ltc_decoder_read(LTCdecoder, &LTCinput);
 				//ltc_frame_to_time(&SMPTEtimeIn, &LTCinput.ltc, 1);
 				SMPTEtimeIn.frame = LTCinput.ltc.frame_tens * 10 + LTCinput.ltc.frame_units;
-				SMPTEtimeIn.secs = LTCinput.ltc.secs_tens * 10 + LTCinput.ltc.mins_units;
-				SMPTEtimeIn.mins = LTCinput.ltc.mins_tens * 10 + LTCinput.ltc.secs_units;
+				SMPTEtimeIn.secs = LTCinput.ltc.secs_tens * 10 + LTCinput.ltc.secs_units;
+				SMPTEtimeIn.mins = LTCinput.ltc.mins_tens * 10 + LTCinput.ltc.mins_units;
 				SMPTEtimeIn.hours = LTCinput.ltc.hours_tens * 10 + LTCinput.ltc.hours_units;
 			}
 
-			// Update the OLED display on each new Frame
-			if (hOLED_task)
-				vTaskResume(hOLED_task);
 			// Update the UI
 			if (hUI_task)
 				vTaskResume(hUI_task);
+
+			// Update the OLED display on each new Frame
+			// NOTE :- This task will put the ESP32 into light-sleep when completed
+			if (hOLED_task)
+				vTaskResume(hOLED_task);
 		}
 		SCOPEOFF(SCOPE_TIMECODE_TASK);
 	} // for(;;)
@@ -743,6 +770,9 @@ void OLED_task(__unused void *pvParams)
 			oled_update();
 		}
 		SCOPEOFF(SCOPE_OLED);
+		// Put processor into light-sleep until next RTC interrupt
+		// The end of this OLED task is the end of processing per RTC interrupt
+		//esp_light_sleep_start();
 	} // for(;;)
 }
 
@@ -821,7 +851,7 @@ bool startWPSPBC()
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 void loop()
 {
-	// This has to run to reset the watchdog
+	SCOPEON(LED_BUILTIN);
 }
 
 void oled_setup()
@@ -886,9 +916,9 @@ void oled_update()
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 	// Print XXXXXXXXX
 	//#warning Implement other OLED code
-	oled.setCursor(0, 64 - 8);
-	static uint16_t oledcount = 0;
-	oled.println(++oledcount);
+	//	oled.setCursor(0, 64 - 8);
+	//	static uint16_t oledcount = 0;
+	//	oled.println(++oledcount);
 
 	//oled.display();		// Regular Adafruit_SS1306::display()
 	oled.fastdisplay(8); // My faster implementation updating only changed pixels
