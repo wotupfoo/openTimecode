@@ -3,22 +3,30 @@
 // --------------------------------------------
 #define DEBUG 1
 //#define ENABLE_WIFI 1
+//#define ENABLE_WIFI_WPS 1
+//#define ENABLE_WIFI_SERVICES 1
+//#define ENABLE_BLUETOOTH 1
 
 #ifdef DEBUG
 #include "debug_scope.h"
 #endif
 
+// --------------------------------------------
 // ESP32 HARDWARE PIN ASSIGNMENTS
 #include "esp32_pins.h"
 
+// --------------------------------------------
 // ESP32 headers
 #include <esp_task_wdt.h>
 #include <esp_sleep.h>
 
+// --------------------------------------------
+// Interface headers
 // !!!!!!! THIS IS NOT MULTI-THREADED !!!!!!!!!
-// !!!!!!! YOU CAN'T USE IT ON CORE 1 !!!!!!!!!
 #include <Wire.h> // I2C
 
+// --------------------------------------------
+// Peripheral headers
 // RTC header
 #include <DS3231.h> // Realtime Clock (RTC) Temperature Compensated Oscillator(TCXO)
 
@@ -30,14 +38,16 @@
 #include <freertos/task.h>
 #include <freertos/semphr.h>
 
+// --------------------------------------------
 // Graphics headers
 //#include "tcMenu_example_menu.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 
 #ifdef ENABLE_WIFI
+#include <Wifi.h>
 #include <WiFiUdp.h>   // UDP
-#include <NTPClient.h> // NTP Client https://github.com/arduino-libraries/NTPClient
+//#include <NTPClient.h> // NTP Client https://github.com/arduino-libraries/NTPClient
 #endif
 
 // --------------------------------------------
@@ -107,6 +117,17 @@ uint8_t readSerialTextBCD2(bool echo);
 
 void oled_update(void);
 void oled_setup(void);
+
+#ifdef ENABLE_BLUETOOTH
+extern void bluetooth_setup(void);
+#endif
+
+#ifdef ENABLE_WIFI
+extern void wifi_setup(void);
+# ifdef ENABLE_WIFI_WPS
+extern void wifi_wps_setup(void);
+# endif
+#endif
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -182,28 +203,28 @@ void IRAM_ATTR interrupt_1Hz(void);
 void IRAM_ATTR interrupt_rtc_clock(void);
 double ReadVoltage(byte pin);
 
-void sendNTPpacket(IPAddress &address); // NTP UDP Manual packet
-bool startWPSPBC();						// NO_WIFI_CHIPSET_HAS_EEPROM
-
 #ifdef ENABLE_WIFI
 // --------------------------------------------
 // WIFI
 // --------------------------------------------
 //#define WIFI_CHIPSET_HAS_EEPROM
-#ifndef WIFI_CHIPSET_HAS_EEPROM
-#ifndef STASSID
-#define STASSID "2924aspen"
-#define STAPSK "deadpool"
-#endif
+# ifndef WIFI_CHIPSET_HAS_EEPROM
+#  ifndef STASSID
+#   define STASSID "2924aspen"
+#   define STAPSK "deadpool"
+#  endif
 const char *ssid = STASSID; // your network SSID (name)
 const char *pass = STAPSK;	// your network password
-#endif
+# endif
 
+# ifdef ENABLE_WIFI_SERVICES
 // --------------------------------------------
 // NTPClient (will be obsoleted with ezTime)
 // --------------------------------------------
 WiFiUDP ntpUDP;
+void sendNTPpacket(IPAddress &address); // NTP UDP Manual packet
 NTPClient timeClient(ntpUDP);
+# endif // ENABLE_WIFI_SERVICES
 #endif //ENABLE_WIFI
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -215,14 +236,14 @@ NTPClient timeClient(ntpUDP);
 void setup()
 {
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-	// Initialize Serial
+	// Initialize Serial (ESP32 Bootloader default is 115200)
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
-	Serial.begin(/*115200*/ 230400);
+	Serial.begin(115200 /*230400*/);
 	delay(100);
 	Serial.println();
 	Serial.println("-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-");
 	Serial.println("-+-+-+-+-+-+-+-+-+-+ OpenTimecode   -+-+-+-+-+-+-+-+-+-+-+-+-");
-	Serial.println("-+-+-+-+-+-+-+-+-+-+ ver 0.1 3/2021 -+-+-+-+-+-+-+-+-+-+-+-+-");
+	Serial.println("-+-+-+-+-+-+-+-+-+-+ ver 0.5 5/2021 -+-+-+-+-+-+-+-+-+-+-+-+-");
 	Serial.println("-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-");
 
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -330,56 +351,13 @@ void setup()
 	// Connect to WiFi, if the stored SSID is invalid join to a station using WPS button
 	// ================================================================================
 	{
-		Serial.println("Starting WiFi");
+# ifdef ENABLE_WIFI_WPS
+		wifi_wps_setup();
+# else
+		wifi_setup();
+# endif
 
-		WiFi.mode(WIFI_STA);
-#ifdef NO_WIFI_CHIPSET_HAS_EEPROM // No WiFi chipset embedded EEPROM storage of the prior SSID,PASS
-		WiFi.begin(ssid, pass);
-#else
-		Serial.printf("Stored SSID='%s' PSK='%s'\n", WiFi.SSID().c_str(), WiFi.psk().c_str());
-		WiFi.begin(WiFi.SSID().c_str(), WiFi.psk().c_str()); // reading data from EEPROM, last saved credentials
-#endif
-		int i = 30; // Wait for up to 30 seconds
-		while (i--)
-		{
-			if (WiFi.status() != WL_CONNECTED)
-			{
-				delay(1000);
-				Serial.print(".");
-			}
-			else
-			{
-				break;
-			}
-		}
-		Serial.println();
-
-		wl_status_t status = WiFi.status();
-		if (status == WL_CONNECTED)
-		{
-			Serial.printf("\nConnected successfully to SSID '%s'\n", WiFi.SSID().c_str());
-		}
-		else
-		{
-			Serial.printf("\nCould not connect to WiFi. state='%d'\n", status);
-			Serial.println("Please press WPS button on your router.\n Press any key to continue...");
-			while (!Serial.available())
-			{
-				;
-			}
-			if (!startWPSPBC())
-			{
-				Serial.println("Failed to connect with WPS");
-			}
-		}
-		Serial.print("Local IP = ");
-		Serial.print(WiFi.localIP());
-		Serial.print("/");
-		Serial.println(WiFi.subnetMask());
-	} // WiFi
-#endif
-
-#ifdef ENABLE_WIFI
+# ifdef ENABLE_WIFI_SERVICES
 	// ================================================================================
 	// Get the TimeZone based on local public IP address
 	// ================================================================================
@@ -392,8 +370,13 @@ void setup()
 	Serial.println("Starting Network Time Task");
 	timeClient.begin();
 	ntp_task();
-#endif
+# endif // ENABLE_WIFI_SERVICES
+	} // WiFi
+#endif // ENABLE_WIFI
 
+#ifdef ENABLE_BLUETOOTH
+	bluetooth_setup();
+#endif
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 	// NOTE : Create Interrupts AFTER Tasks & Semaphores they serve are created
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
@@ -598,7 +581,7 @@ void IRAM_ATTR interrupt_1Hz(void)
 // TASKS
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
-void LTCtimecode_task(__unused void *pvParams)
+void IRAM_ATTR LTCtimecode_task(__unused void *pvParams)
 {
 	TaskHandle_t taskself = xTaskGetCurrentTaskHandle();
 #if 1
@@ -783,9 +766,135 @@ void UI_task(__unused void *pvParams)
 	Serial.print((uint32_t)taskself);
 	Serial.println(") task");
 
+	//vTaskSuspend(taskself);
+
+	uint8_t c;
+	SMPTETimecode s;
+	s.years = 0;
+	s.months = 0;
+	s.days = 0;
+	s.hours = 0;
+	s.mins = 0;
+	s.secs = 0;
+	s.frame = 0;
+
+	Serial.println("RTC Modify format requires a 0 in front of single digit values:");
+	Serial.println("Y99 = 2000.2099");
+	Serial.println("M12 = 0..12");
+	Serial.println("D31 = 0..59");
+	Serial.println("h23 = 0..59");
+	Serial.println("m59 = 0..59");
+	Serial.println("s59 = 0..59");
+	Serial.println("F formatted YYMMDDhhssmm");
+	Serial.println("W to program the DS3231 RTC clock");
+	Serial.println("P to print current values\n\r");
+
+	char serialbuffer[20];
 	for (;;)
 	{
 		vTaskSuspend(taskself);
+		if (Serial.available() == 0)
+		{
+			continue;
+		}
+		else
+		{
+			switch (Serial.peek())
+			{
+			case 'Y':
+				Serial.write(c = Serial.read());
+				s.years = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'M':
+				Serial.write(Serial.read());
+				s.months = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'D':
+				Serial.write(Serial.read());
+				s.days = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'h':
+				Serial.write(Serial.read());
+				s.hours = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'm':
+				Serial.write(Serial.read());
+				s.mins = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 's':
+				Serial.write(Serial.read());
+				s.secs = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'F': // Guaranteed formatted
+				Serial.write(Serial.read());
+				s.years = readSerialTextBCD2(true);
+				s.months = readSerialTextBCD2(true);
+				s.days = readSerialTextBCD2(true);
+				s.hours = readSerialTextBCD2(true);
+				s.mins = readSerialTextBCD2(true);
+				s.secs = readSerialTextBCD2(true);
+				Serial.println();
+				break;
+
+			case 'P': // Print current values
+				Serial.write(Serial.read());
+				snprintf(serialbuffer,
+						 sizeof(serialbuffer),
+						 "20%02d-%02d-%02d %02d:%02d:%02d.00",
+						 s.years,
+						 s.months,
+						 s.days,
+						 s.hours,
+						 s.mins,
+						 s.secs);
+				Serial.println(serialbuffer);
+				Serial.println();
+				break;
+
+			case 'W': // Store to RTC
+				Serial.write(Serial.read());
+				Serial.println();
+				xSemaphoreTake(xRTC, portMAX_DELAY);
+				{
+					RTCchip.setClockMode(false); // 24hr
+					RTCchip.setYear(s.years);
+					RTCchip.setMonth(s.months);
+					RTCchip.setDate(s.days);
+					RTCchip.setHour(s.hours);
+					RTCchip.setMinute(s.mins);
+					RTCchip.setSecond(s.secs);
+					RTCtime = RTCchip.now();
+				}
+				xSemaphoreGive(xRTC);
+				snprintf(serialbuffer,
+						 sizeof(serialbuffer),
+						 "20%02d-%02d-%02d %02d:%02d:%02d.00",
+						 s.years,
+						 s.months,
+						 s.days,
+						 s.hours,
+						 s.mins,
+						 s.secs);
+				Serial.println(serialbuffer);
+				break;
+
+			default:
+				Serial.write(Serial.read());
+				break;
+			}
+		}
 	}
 }
 
@@ -794,6 +903,34 @@ void UI_task(__unused void *pvParams)
 // LOCAL SUB-ROUTINES
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
+
+uint8_t readSerialTextBCD2(bool echo)
+{
+	uint8_t v[2];
+	while (Serial.available() == 0)
+	{
+		taskYIELD();
+	}
+	v[0] = Serial.read();
+	if (v[0] < '0' || v[0] > '9')
+		return 0;
+	if (echo)
+		Serial.write(v[0]);
+
+	while (Serial.available() == 0)
+	{
+		taskYIELD();
+	}
+	v[1] = Serial.read();
+	if (v[1] < '0' || v[1] > '9')
+		return 0;
+	if (echo)
+		Serial.write(v[1]);
+	v[0] -= '0';
+	v[1] -= '0';
+
+	return v[0] * 10 + v[1];
+}
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
 // Polynomial improved linear response in ADC reading based on 0-3.3v
@@ -817,32 +954,6 @@ double ReadVoltage(byte pin)
 	*  3775     3.0
 	*/
 } // Added an improved polynomial, use either, comment out as required
-
-#ifdef ENABLE_WIFI
-/* Wireless Protected Setup (WPS) join-wireless-network-by-a-button 
- *  https://gist.github.com/copa2/fcc718c6549721c210d614a325271389
- */
-bool startWPSPBC()
-{
-	Serial.println("WPS config start");
-	bool wpsSuccess = WiFi.beginWPSConfig();
-	if (wpsSuccess)
-	{
-		// Well this means not always success :-/ in case of a timeout we have an empty ssid
-		String newSSID = WiFi.SSID();
-		if (newSSID.length() > 0)
-		{
-			// WPSConfig has already connected in STA mode successfully to the new station.
-			Serial.printf("WPS finished. Connected successfully to SSID '%s'\n", newSSID.c_str());
-		}
-		else
-		{
-			wpsSuccess = false;
-		}
-	}
-	return wpsSuccess;
-}
-#endif
 
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
 // =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=
@@ -891,8 +1002,11 @@ void oled_update()
 	// RTC Time
 	oled.setCursor(TIMECODE_X, TIMECODE_Y - 8);
 	oled.setTextSize(1);
-	snprintf(oled_buff, OLED_BUFF_MAX, "RTC CLK %02d:%02d:%02d",
-			 RTCtime.hour(), RTCtime.minute(), RTCtime.second());
+	snprintf(oled_buff, OLED_BUFF_MAX, "RTC CLK %02d:%02d:%02d%s%d",
+			 RTCtime.hour(), RTCtime.minute(), RTCtime.second(),
+			 RTCtime.second() < SMPTEtime.secs ? "-" : RTCtime.second() > SMPTEtime.secs ? "+"
+																						 : " ",
+			 SMPTEtime.secs - RTCtime.second());
 	oled.println(oled_buff);
 
 	//display.writeFillRect(0/*TIMECODE_X*/,TIMECODE_Y-8,
@@ -911,6 +1025,21 @@ void oled_update()
 	oled.setTextSize(1);
 	snprintf(oled_buff, OLED_BUFF_MAX, "LTC  IN %02d:%02d:%02d.%02d",
 			 SMPTEtimeIn.hours, SMPTEtimeIn.mins, SMPTEtimeIn.secs, SMPTEtimeIn.frame);
+	oled.println(oled_buff);
+
+	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
+	// Print Temperature
+	//#warning Implement other OLED code
+	oled.setCursor(128 - 40, 64 - 16);
+	oled.setTextSize(1);
+#define CtoF(x) ((x * 9.0 / 5.0) + 32.0)
+#define FtoC(x) ((x - 32.0) * 5.0 / 9.0)
+	snprintf(oled_buff, OLED_BUFF_MAX, "%3.1f%cF", CtoF(RTCtemperature), 0xF8 /*degrees 'o'*/);
+	oled.println(oled_buff);
+
+	oled.setCursor(128 - 40, 64 - 8);
+	oled.setTextSize(1);
+	snprintf(oled_buff, OLED_BUFF_MAX, "%3.1f%cC", RTCtemperature, 0xF8 /*degrees 'o'*/);
 	oled.println(oled_buff);
 
 	// =-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-
